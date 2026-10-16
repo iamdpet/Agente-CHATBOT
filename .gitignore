@@ -1,0 +1,11 @@
+# NUNCA subir la clave de API
+.env
+ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY.env
+*.env
+.streamlit/secrets.toml
+
+# Temporales de Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -1,0 +1,6 @@
+streamlit>=1.30
+anthropic>=0.40
+chromadb==1.5.9
+sentence-transformers>=2.2
+python-dotenv>=1.0
+pandas>=2.0
