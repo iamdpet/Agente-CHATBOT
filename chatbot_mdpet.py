@@ -349,12 +349,43 @@ matcher = cargar_matcher()
 # ─────────────────────────────────────────────
 # Motor RAG (Anthropic)
 # ─────────────────────────────────────────────
-def llamar_claude(system: str, user: str, modelo: str, max_tokens: int = 800) -> str:
+def llamar_claude(system: str, user: str, modelo: str, max_tokens: int = 800,
+                  historial: list | None = None) -> str:
+    """Llama a Claude. Si se pasa 'historial' (lista de turnos previos
+    {'role': 'user'|'assistant', 'content': str}), se incluye antes del
+    mensaje actual para que el modelo mantenga el hilo de la conversación."""
+    mensajes = []
+    if historial:
+        mensajes.extend(historial)
+    mensajes.append({"role": "user", "content": user})
     resp = claude.messages.create(
         model=modelo, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": user}],
+        messages=mensajes,
     )
     return resp.content[0].text.strip()
+
+
+# Cuántos turnos (pregunta+respuesta) de contexto se le pasan a Claude.
+# Mantenerlo bajo cuida el costo: 3 turnos alcanzan para seguir el hilo.
+MAX_TURNOS_MEMORIA = 3
+
+
+def construir_historial(mensajes: list) -> list:
+    """Toma st.session_state.mensajes y arma el historial para Claude:
+    los últimos MAX_TURNOS_MEMORIA intercambios, sin el mensaje actual.
+    Trunca cada respuesta larga para no inflar el costo de tokens."""
+    hist = []
+    for m in mensajes:
+        rol = "user" if m.get("rol") == "usuario" else "assistant"
+        texto = (m.get("contenido") or "").strip()
+        if not texto:
+            continue
+        # Recortar respuestas muy largas (series, etc.) para ahorrar tokens.
+        if len(texto) > 600:
+            texto = texto[:600] + " […]"
+        hist.append({"role": rol, "content": texto})
+    # Nos quedamos con los últimos N turnos (2 mensajes = 1 turno).
+    return hist[-(MAX_TURNOS_MEMORIA * 2):]
 
 
 PALABRAS_SQL = ["cuánto", "cuanto", "cuál fue", "cual fue", "valor", "porcentaje",
@@ -471,6 +502,31 @@ SYSTEM_RESPUESTA = (
     "8. Español rioplatense, claro y conciso."
 )
 
+# System prompt para redactar en tono conversacional los datos que vienen de la
+# base (capa directa). La REGLA DE ORO: el número/dato ya está calculado y es el
+# que hay que usar tal cual; Claude solo lo envuelve en una frase natural y
+# atiende el hilo de la conversación. Nunca inventa ni cambia cifras.
+SYSTEM_CONVERSA = (
+    "Sos el asistente conversacional de Mar del Plata Entre Todos "
+    "(mardelplataentretodos.org), una plataforma ciudadana de indicadores "
+    "urbanos, ambientales y fiscales de Mar del Plata.\n"
+    "Te voy a pasar un DATO YA VERIFICADO extraído de la base oficial. Tu tarea "
+    "es responderle a la persona de forma natural, cálida y conversacional, "
+    "en español rioplatense, como lo haría una persona que conoce bien el tema.\n"
+    "REGLAS ESTRICTAS:\n"
+    "1. Usá EXACTAMENTE las cifras, años y nombres del dato provisto. "
+    "Nunca inventes, redondees distinto ni agregues números que no estén.\n"
+    "2. No agregues datos de otros años, otras ciudades ni comparaciones que no "
+    "estén en el dato provisto. Si no está, no lo digas.\n"
+    "3. Podés dar una frase breve de contexto o interpretación simple "
+    "(si subió/bajó, si es alto/bajo), pero sin inventar causas ni proyecciones.\n"
+    "4. Tené en cuenta el hilo de la conversación: si la persona pregunta algo "
+    "de seguimiento ('¿y en 2020?', '¿y comparado?'), respondé a eso.\n"
+    "5. Sé breve: 2 a 4 oraciones. Nada de listas largas salvo que el dato lo sea.\n"
+    "6. Mantené el enlace a la planilla oficial si viene incluido.\n"
+    "7. Tono amable y claro, sin tecnicismos innecesarios."
+)
+
 
 # ============================================================
 #  NAVEGACIÓN DEL REPOSITORIO — Colección 9 "Indicadores y sets de datos"
@@ -572,25 +628,30 @@ def listado_coleccion9_markdown() -> str:
     return "\n".join(lineas)
 
 
-def responder(pregunta: str) -> dict:
-    # 0. Capa directa sin LLM: gratis, instantánea y sin alucinación.
+def responder(pregunta: str, historial: list | None = None) -> dict:
+    # 0. Capa directa: el DATO sale de la base (exacto, sin alucinación);
+    #    Claude solo lo redacta en tono conversacional y sigue el hilo.
     directo = matcher.resolver(pregunta)
     if directo is not None:
         enlace = enlace_excel(directo.get("tema", ""))
-        # Preguntas de evolución/tendencia: el LLM interpreta la serie en lenguaje natural.
+
+        # 0.a Evolución / tendencia: Claude interpreta la serie completa.
         if directo.get("interpretar"):
             try:
                 system = (
-                    "Sos el asistente de Mar del Plata Entre Todos. Te paso la serie "
-                    "histórica REAL de un indicador. Redactá una lectura breve y clara "
-                    "de su evolución, en español rioplatense: tendencia general, cuánto "
-                    "cambió, y los años de subas o bajas marcadas si las hay. "
-                    "USÁ SOLO los valores provistos; no inventes ni estimes años faltantes. "
+                    "Sos el asistente conversacional de Mar del Plata Entre Todos. "
+                    "Te paso la serie histórica REAL de un indicador. Redactá una "
+                    "lectura clara y natural de su evolución, en español rioplatense: "
+                    "tendencia general, cuánto cambió, y los años de subas o bajas "
+                    "marcadas si las hay. USÁ SOLO los valores provistos; no inventes "
+                    "ni estimes años faltantes. Tené en cuenta el hilo de la charla "
+                    "si la persona viene preguntando algo relacionado. "
                     "Sé conciso (4-6 líneas). No repitas toda la lista año por año.")
                 user = (f"Indicador: {directo['nombre_ind']}\n\n"
                         f"Serie:\n{directo['serie']}\n\n"
                         f"{directo.get('resumen','')}\n\nPregunta: {pregunta}")
-                narracion = llamar_claude(system, user, MODELO_RESPUESTA, 500)
+                narracion = llamar_claude(system, user, MODELO_RESPUESTA, 500,
+                                          historial=historial)
                 respuesta = (f"{directo['respuesta']}\n\n---\n\n{narracion}{enlace}")
                 return {"respuesta": respuesta, "tipo": "evolucion",
                         "sql": None, "chunks": [], "error": None}
@@ -598,9 +659,21 @@ def responder(pregunta: str) -> dict:
                 # Si falla el LLM, al menos devolvemos la serie (gratis, sin romper).
                 return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
                         "sql": None, "chunks": [], "error": None}
-        respuesta = directo["respuesta"] + enlace
-        return {"respuesta": respuesta, "tipo": "directo",
-                "sql": None, "chunks": [], "error": None}
+
+        # 0.b Dato puntual / último valor: Claude lo envuelve en una frase natural.
+        #     El número ya está calculado en directo["respuesta"]; Claude NO lo cambia.
+        try:
+            user = (f"DATO VERIFICADO (de la base oficial):\n{directo['respuesta']}"
+                    f"{enlace}\n\nPregunta de la persona: {pregunta}\n\n"
+                    "Redactá la respuesta conversacional usando ese dato exacto.")
+            texto = llamar_claude(SYSTEM_CONVERSA, user, MODELO_RESPUESTA, 400,
+                                  historial=historial)
+            return {"respuesta": texto, "tipo": "directo",
+                    "sql": None, "chunks": [], "error": None}
+        except Exception:
+            # Fallback: si Claude falla, devolvemos el texto directo (gratis, sin romper).
+            return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
+                    "sql": None, "chunks": [], "error": None}
 
     clasificacion = clasificar_pregunta(pregunta)
     tipo = clasificacion["tipo"]
@@ -663,6 +736,7 @@ def responder(pregunta: str) -> dict:
         SYSTEM_RESPUESTA,
         f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta}",
         MODELO_RESPUESTA, 800,
+        historial=historial,
     )
     return {"respuesta": respuesta_texto, "tipo": tipo, "sql": res_sql,
             "chunks": res_chroma["chunks"] if res_chroma else [],
@@ -776,8 +850,10 @@ if "tema_abierto" not in st.session_state:
 
 def procesar(pregunta):
     """Agrega la pregunta y su respuesta a la conversación."""
+    # Historial ANTES de agregar la pregunta actual (memoria conversacional).
+    historial = construir_historial(st.session_state.mensajes)
     st.session_state.mensajes.append({"rol": "usuario", "contenido": pregunta, "detalle": None})
-    resultado = responder(pregunta)
+    resultado = responder(pregunta, historial=historial)
     detalle = {"tipo": resultado["tipo"], "sql": resultado.get("sql"),
                "chunks": resultado.get("chunks", [])}
     st.session_state.mensajes.append({
