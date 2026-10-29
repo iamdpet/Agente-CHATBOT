@@ -98,6 +98,15 @@ def cargar_recursos():
 
 claude, coleccion_pdf, modelo_emb, conn_db = cargar_recursos()
 
+# Rango de años REAL de la base (se adapta solo cuando se agregan años nuevos).
+try:
+    _rango = conn_db.execute(
+        "SELECT MIN(anio), MAX(anio) FROM mediciones").fetchone()
+    ANIO_MIN = int(_rango[0]) if _rango and _rango[0] else 2014
+    ANIO_MAX = int(_rango[1]) if _rango and _rango[1] else 2025
+except Exception:
+    ANIO_MIN, ANIO_MAX = 2014, 2025
+
 # ─────────────────────────────────────────────
 # Schema SQL construido con los temas reales de la base
 # ─────────────────────────────────────────────
@@ -163,15 +172,31 @@ def tokens_utiles(texto: str) -> set:
 
 
 def extraer_anios(pregunta: str) -> list:
-    """Años 2014-2024 mencionados en la pregunta (los válidos en la base)."""
+    """Años mencionados en la pregunta que están dentro del rango real de la base."""
     return sorted({int(a) for a in re.findall(r"\b(20\d{2})\b", pregunta)
-                   if 2014 <= int(a) <= 2024})
+                   if ANIO_MIN <= int(a) <= ANIO_MAX})
 
 
 def hay_anio_fuera_de_rango(pregunta: str) -> bool:
-    """True si menciona un año 20xx que NO está en 2014-2024."""
+    """True si menciona un año 20xx que NO está en el rango real de la base."""
     todos = [int(a) for a in re.findall(r"\b(20\d{2})\b", pregunta)]
-    return any(not (2014 <= a <= 2024) for a in todos)
+    return any(not (ANIO_MIN <= a <= ANIO_MAX) for a in todos)
+
+
+_PALABRAS_EVOLUCION = [
+    "evolución", "evolucion", "evolucionó", "evoluciono", "evolucionar",
+    "tendencia", "cómo cambió", "como cambio", "cómo varió", "como vario",
+    "a lo largo", "con el tiempo", "en el tiempo", "a través de los años",
+    "mejoró", "mejoro", "empeoró", "empeoro", "subió", "subio", "bajó", "bajo",
+    "aumentó", "aumento", "disminuyó", "disminuyo", "creció", "crecio",
+    "evolucion", "serie", "histórico", "historico", "trayectoria",
+]
+
+
+def es_pregunta_evolucion(pregunta: str) -> bool:
+    """True si la pregunta pide una tendencia/evolución (y no un dato puntual)."""
+    p = normalizar(pregunta)
+    return any(normalizar(w) in p for w in _PALABRAS_EVOLUCION)
 
 
 class MatcherDirecto:
@@ -256,27 +281,38 @@ class MatcherDirecto:
         if hay_anio_fuera_de_rango(pregunta) and not anios:
             disp = ", ".join(str(x) for x in sorted(d))
             txt  = (f"El indicador **{mejor['nombre']}** ({mejor['tema']}) solo tiene datos "
-                    f"entre 2014 y 2024.\n\nAños disponibles: {disp}.")
+                    f"entre {ANIO_MIN} y {ANIO_MAX}.\n\nAños disponibles: {disp}.")
             return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                     "via": "directo_fuera_rango", "score": round(mejor_score, 3)}
 
-        # ── Evolución (dos o más años)
-        if len(anios) >= 2:
-            a0, a1 = anios[0], anios[-1]
+        # ── Evolución / tendencia
+        #    Se dispara si pidieron un rango de 2+ años, O si la pregunta usa
+        #    palabras de evolución (aunque mencionen 0 o 1 año: "cómo evolucionó").
+        pide_evolucion = es_pregunta_evolucion(pregunta)
+        if len(anios) >= 2 or (pide_evolucion and len(d) >= 2):
+            if len(anios) >= 2:
+                a0, a1 = anios[0], anios[-1]
+            else:
+                a0, a1 = min(d), max(d)   # toda la serie disponible
             tramo  = [(a, d[a]) for a in sorted(d) if a0 <= a <= a1]
             if not tramo:
                 return None
             lineas = [f"- {a}: {self._fmt_valor(v[0], v[1], mejor)}" for a, v in tramo]
-            txt = (f"**{mejor['nombre']}** ({mejor['tema']}), evolución {a0}–{a1}:\n\n"
-                   + "\n".join(lineas))
+            serie_txt = "\n".join(lineas)
             prim, ult = tramo[0][1][0], tramo[-1][1][0]
+            resumen = ""
             if prim not in (None, 0) and ult is not None:
                 var   = (ult - prim) / abs(prim) * 100
                 signo = "aumentó" if var > 0 else "disminuyó"
-                txt += (f"\n\nEntre {tramo[0][0]} y {tramo[-1][0]} {signo} "
-                        f"{abs(var):.1f}% en términos relativos.")
+                resumen = (f"Entre {tramo[0][0]} y {tramo[-1][0]} {signo} "
+                           f"{abs(var):.1f}% en términos relativos.")
+            txt = (f"**{mejor['nombre']}** ({mejor['tema']}), evolución {a0}–{a1}:\n\n"
+                   + serie_txt + (f"\n\n{resumen}" if resumen else ""))
+            # Devolvemos la serie para que responder() la pase al LLM a interpretar.
             return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
-                    "via": "directo_evolucion", "score": round(mejor_score, 3)}
+                    "via": "directo_evolucion", "score": round(mejor_score, 3),
+                    "interpretar": True, "serie": serie_txt, "resumen": resumen,
+                    "nombre_ind": mejor["nombre"]}
 
         # ── Año puntual
         if len(anios) == 1:
@@ -540,7 +576,29 @@ def responder(pregunta: str) -> dict:
     # 0. Capa directa sin LLM: gratis, instantánea y sin alucinación.
     directo = matcher.resolver(pregunta)
     if directo is not None:
-        respuesta = directo["respuesta"] + enlace_excel(directo.get("tema", ""))
+        enlace = enlace_excel(directo.get("tema", ""))
+        # Preguntas de evolución/tendencia: el LLM interpreta la serie en lenguaje natural.
+        if directo.get("interpretar"):
+            try:
+                system = (
+                    "Sos el asistente de Mar del Plata Entre Todos. Te paso la serie "
+                    "histórica REAL de un indicador. Redactá una lectura breve y clara "
+                    "de su evolución, en español rioplatense: tendencia general, cuánto "
+                    "cambió, y los años de subas o bajas marcadas si las hay. "
+                    "USÁ SOLO los valores provistos; no inventes ni estimes años faltantes. "
+                    "Sé conciso (4-6 líneas). No repitas toda la lista año por año.")
+                user = (f"Indicador: {directo['nombre_ind']}\n\n"
+                        f"Serie:\n{directo['serie']}\n\n"
+                        f"{directo.get('resumen','')}\n\nPregunta: {pregunta}")
+                narracion = llamar_claude(system, user, MODELO_RESPUESTA, 500)
+                respuesta = (f"{directo['respuesta']}\n\n---\n\n{narracion}{enlace}")
+                return {"respuesta": respuesta, "tipo": "evolucion",
+                        "sql": None, "chunks": [], "error": None}
+            except Exception:
+                # Si falla el LLM, al menos devolvemos la serie (gratis, sin romper).
+                return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
+                        "sql": None, "chunks": [], "error": None}
+        respuesta = directo["respuesta"] + enlace
         return {"respuesta": respuesta, "tipo": "directo",
                 "sql": None, "chunks": [], "error": None}
 
