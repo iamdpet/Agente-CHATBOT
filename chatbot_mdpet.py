@@ -43,9 +43,21 @@ def cargar_api_key(carpeta: Path) -> str:
     return os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
 
-ANTHROPIC_API_KEY = cargar_api_key(RUTA_BASE)
-RUTA_DB             = CFG["RUTA_DB"]
-RUTA_CHROMA         = CFG["RUTA_CHROMA"]
+try:
+    ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"].strip()
+except Exception:
+    ANTHROPIC_API_KEY = cargar_api_key(RUTA_BASE)
+def _resolver_ruta(valor, respaldo_relativo):
+    p = Path(valor)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    rel = (RUTA_BASE / valor)
+    if rel.exists():
+        return str(rel)
+    return str(RUTA_BASE / respaldo_relativo)
+
+RUTA_DB     = _resolver_ruta(CFG["RUTA_DB"],     "datos/mdpet.db")
+RUTA_CHROMA = _resolver_ruta(CFG["RUTA_CHROMA"], "datos/chromadb")
 MODELO_CLASIFICADOR = CFG["MODELO_CLASIFICADOR"]
 MODELO_SQL          = CFG.get("MODELO_SQL", CFG["MODELO_CLASIFICADOR"])
 MODELO_RESPUESTA    = CFG["MODELO_RESPUESTA"]
@@ -245,7 +257,7 @@ class MatcherDirecto:
             disp = ", ".join(str(x) for x in sorted(d))
             txt  = (f"El indicador **{mejor['nombre']}** ({mejor['tema']}) solo tiene datos "
                     f"entre 2014 y 2024.\n\nAños disponibles: {disp}.")
-            return {"respuesta": txt + pie, "indicador": mejor["nombre"],
+            return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                     "via": "directo_fuera_rango", "score": round(mejor_score, 3)}
 
         # ── Evolución (dos o más años)
@@ -263,7 +275,7 @@ class MatcherDirecto:
                 signo = "aumentó" if var > 0 else "disminuyó"
                 txt += (f"\n\nEntre {tramo[0][0]} y {tramo[-1][0]} {signo} "
                         f"{abs(var):.1f}% en términos relativos.")
-            return {"respuesta": txt + pie, "indicador": mejor["nombre"],
+            return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                     "via": "directo_evolucion", "score": round(mejor_score, 3)}
 
         # ── Año puntual
@@ -275,12 +287,12 @@ class MatcherDirecto:
                         f"Años con dato disponible: {disp}.\n\n"
                         f"Para informes y documentos completos: "
                         f"https://mardelplataentretodos.org/repositorio/")
-                return {"respuesta": txt + pie, "indicador": mejor["nombre"],
+                return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                         "via": "directo_sin_dato", "score": round(mejor_score, 3)}
             vn, vt = d[a]
             txt = (f"**{mejor['nombre']}** ({mejor['tema']}) en {a}: "
                    f"**{self._fmt_valor(vn, vt, mejor)}**")
-            return {"respuesta": txt + pie, "indicador": mejor["nombre"],
+            return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                     "via": "directo_anio", "score": round(mejor_score, 3)}
 
         # ── Sin año: último disponible
@@ -288,7 +300,7 @@ class MatcherDirecto:
         vn, vt = d[a_ult]
         txt = (f"**{mejor['nombre']}** ({mejor['tema']}), último dato disponible "
                f"({a_ult}): **{self._fmt_valor(vn, vt, mejor)}**")
-        return {"respuesta": txt + pie, "indicador": mejor["nombre"],
+        return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                 "via": "directo_ultimo", "score": round(mejor_score, 3)}
 
 @st.cache_resource
@@ -424,11 +436,112 @@ SYSTEM_RESPUESTA = (
 )
 
 
+# ============================================================
+#  NAVEGACIÓN DEL REPOSITORIO — Colección 9 "Indicadores y sets de datos"
+# ============================================================
+# Los 15 Excel de "Resumen de Indicadores" por tema, con su link a la
+# página del documento en el repositorio (url_item, /items/show/NNN).
+# Se prioriza esta colección: es la fuente primaria de los datos numéricos.
+#
+# Para actualizar: si agregan un Excel nuevo a la colección 9, sumá una
+# fila acá con su id_item (el número que aparece en la URL del documento).
+
+BASE_REPO = "https://mardelplataentretodos.org/repositorio"
+COLECCION_9_URL = f"{BASE_REPO}/items/browse?collection=9"
+
+# Excel oficiales de indicadores por tema (colección 9).
+# Clave: nombre corto para mostrar. Valores: id_item y período.
+EXCEL_INDICADORES = [
+    {"tema": "Agua, saneamiento y drenaje", "id_item": 149, "periodo": "2014-2024"},
+    {"tema": "Ambiente",                    "id_item": 150, "periodo": "2014-2024"},
+    {"tema": "Conectividad",                "id_item": 207, "periodo": "2014-2025"},
+    {"tema": "Educación",                   "id_item": 153, "periodo": "2014-2024"},
+    {"tema": "Economía y Empleo",           "id_item": 152, "periodo": "2014-2025"},
+    {"tema": "Energía",                     "id_item": 154, "periodo": "2014-2025"},
+    {"tema": "Gestión de Residuos Sólidos", "id_item": 157, "periodo": "2014-2025"},
+    {"tema": "Gestión Pública Participativa","id_item": 162, "periodo": "2014-2025"},
+    {"tema": "Inequidad Urbana",            "id_item": 155, "periodo": "2014-2025"},
+    {"tema": "Logística",                   "id_item": 147, "periodo": "2014-2024"},
+    {"tema": "Movilidad",                   "id_item": 156, "periodo": "2014-2025"},
+    {"tema": "Salud",                       "id_item": 158, "periodo": "2014-2024"},
+    {"tema": "Seguridad Ciudadana",         "id_item": 148, "periodo": "2014-2024"},
+    {"tema": "Turismo Sostenible",          "id_item": 159, "periodo": "2014-2024"},
+    {"tema": "Vivienda y Uso de Suelo",     "id_item": 160, "periodo": "2014-2025"},
+]
+
+for _e in EXCEL_INDICADORES:
+    _e["url"] = f"{BASE_REPO}/items/show/{_e['id_item']}"
+    _e["titulo"] = f"Resumen de Indicadores de {_e['tema']} ({_e['periodo']})"
+
+# Puente: tema de un indicador en la base  ->  tema del Excel de la colección 9.
+# Los temas de la base (28) se mapean al Excel temático que les corresponde.
+# Si un tema no está acá, no se ofrece Excel (pero igual se responde el dato).
+MAPA_TEMA_A_EXCEL = {
+    "Agua": "Agua, saneamiento y drenaje",
+    "Saneamiento y Drenaje": "Agua, saneamiento y drenaje",
+    "Calidad de Aire": "Ambiente",
+    "Mitigación del Cambio Climático": "Ambiente",
+    "Ruido": "Ambiente",
+    "Conectividad": "Conectividad",
+    "Educación": "Educación",
+    "Empleo": "Economía y Empleo",
+    "Competitividad de la Economía": "Economía y Empleo",
+    "Competitividad de la Economía. Logística": "Logística",
+    "Competitividad de la Economía. Producción": "Economía y Empleo",
+    "Energía": "Energía",
+    "Gestión de Residuos Sólidos": "Gestión de Residuos Sólidos",
+    "Gestión Pública Participativa": "Gestión Pública Participativa",
+    "Gestión Pública Moderna": "Gestión Pública Participativa",
+    "Transparencia": "Gestión Pública Participativa",
+    "Inequidad Urbana": "Inequidad Urbana",
+    "Población": "Inequidad Urbana",
+    "Movilidad": "Movilidad",
+    "Salud": "Salud",
+    "Seguridad Ciudadana": "Seguridad Ciudadana",
+    "Turismo Sostenible": "Turismo Sostenible",
+    "Vivienda": "Vivienda y Uso de Suelo",
+    "Uso del suelo": "Vivienda y Uso de Suelo",
+    # Temas de deuda/gasto/impuestos no tienen Excel propio en la colección 9
+}
+
+_EXCEL_POR_TEMA = {e["tema"]: e for e in EXCEL_INDICADORES}
+
+
+def excel_para_tema(tema_base: str):
+    """Dado el tema de un indicador de la base, devuelve el Excel oficial
+    de la colección 9 que le corresponde, o None si no hay."""
+    tema_excel = MAPA_TEMA_A_EXCEL.get(tema_base)
+    if not tema_excel:
+        return None
+    return _EXCEL_POR_TEMA.get(tema_excel)
+
+
+def enlace_excel(tema_base: str) -> str:
+    """Devuelve una línea markdown con el enlace al Excel del tema, o ''."""
+    e = excel_para_tema(tema_base)
+    if not e:
+        return ""
+    return (f"\n\n📊 **Ver todos los indicadores de {e['tema']}** "
+            f"(datos oficiales, {e['periodo']}): [{e['titulo']}]({e['url']})")
+
+
+def listado_coleccion9_markdown() -> str:
+    """Texto markdown con todos los Excel de indicadores, para el modo explorar."""
+    lineas = ["Estos son los **resúmenes oficiales de indicadores** por tema "
+              "(planillas Excel con toda la serie, fuentes y cálculos):\n"]
+    for e in sorted(EXCEL_INDICADORES, key=lambda x: x["tema"]):
+        lineas.append(f"- 📊 [{e['tema']} ({e['periodo']})]({e['url']})")
+    lineas.append(f"\n🔗 Ver la colección completa en el repositorio: "
+                  f"[Indicadores y sets de datos]({COLECCION_9_URL})")
+    return "\n".join(lineas)
+
+
 def responder(pregunta: str) -> dict:
     # 0. Capa directa sin LLM: gratis, instantánea y sin alucinación.
     directo = matcher.resolver(pregunta)
     if directo is not None:
-        return {"respuesta": directo["respuesta"], "tipo": "directo",
+        respuesta = directo["respuesta"] + enlace_excel(directo.get("tema", ""))
+        return {"respuesta": respuesta, "tipo": "directo",
                 "sql": None, "chunks": [], "error": None}
 
     clasificacion = clasificar_pregunta(pregunta)
@@ -641,6 +754,10 @@ with st.expander("💡 Preguntas sugeridas por tema", expanded=(len(st.session_s
                          use_container_width=True):
                 st.session_state.pregunta_pendiente = preg
                 st.rerun()
+
+# ── Panel para explorar el repositorio (planillas Excel oficiales, colección 9)
+with st.expander("📂 Explorar indicadores por tema (planillas oficiales)"):
+    st.markdown(listado_coleccion9_markdown())
 
 # ── Entrada de texto libre (siempre disponible)
 entrada = st.chat_input("Escribí tu pregunta sobre Mar del Plata...")
