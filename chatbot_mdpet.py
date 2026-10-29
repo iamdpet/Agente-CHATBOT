@@ -98,6 +98,7 @@ def cargar_recursos():
 
 claude, coleccion_pdf, modelo_emb, conn_db = cargar_recursos()
 
+<<<<<<< HEAD
 # Rango de años REAL de la base (se adapta solo cuando se agregan años nuevos).
 try:
     _rango = conn_db.execute(
@@ -107,6 +108,8 @@ try:
 except Exception:
     ANIO_MIN, ANIO_MAX = 2014, 2025
 
+=======
+>>>>>>> 11ea89544e428856f0ad354c553fa14d303ae4e4
 # ─────────────────────────────────────────────
 # Schema SQL construido con los temas reales de la base
 # ─────────────────────────────────────────────
@@ -172,6 +175,7 @@ def tokens_utiles(texto: str) -> set:
 
 
 def extraer_anios(pregunta: str) -> list:
+<<<<<<< HEAD
     """Años mencionados en la pregunta que están dentro del rango real de la base."""
     return sorted({int(a) for a in re.findall(r"\b(20\d{2})\b", pregunta)
                    if ANIO_MIN <= int(a) <= ANIO_MAX})
@@ -197,6 +201,17 @@ def es_pregunta_evolucion(pregunta: str) -> bool:
     """True si la pregunta pide una tendencia/evolución (y no un dato puntual)."""
     p = normalizar(pregunta)
     return any(normalizar(w) in p for w in _PALABRAS_EVOLUCION)
+=======
+    """Años 2014-2024 mencionados en la pregunta (los válidos en la base)."""
+    return sorted({int(a) for a in re.findall(r"\b(20\d{2})\b", pregunta)
+                   if 2014 <= int(a) <= 2024})
+
+
+def hay_anio_fuera_de_rango(pregunta: str) -> bool:
+    """True si menciona un año 20xx que NO está en 2014-2024."""
+    todos = [int(a) for a in re.findall(r"\b(20\d{2})\b", pregunta)]
+    return any(not (2014 <= a <= 2024) for a in todos)
+>>>>>>> 11ea89544e428856f0ad354c553fa14d303ae4e4
 
 
 class MatcherDirecto:
@@ -281,6 +296,7 @@ class MatcherDirecto:
         if hay_anio_fuera_de_rango(pregunta) and not anios:
             disp = ", ".join(str(x) for x in sorted(d))
             txt  = (f"El indicador **{mejor['nombre']}** ({mejor['tema']}) solo tiene datos "
+<<<<<<< HEAD
                     f"entre {ANIO_MIN} y {ANIO_MAX}.\n\nAños disponibles: {disp}.")
             return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
                     "via": "directo_fuera_rango", "score": round(mejor_score, 3)}
@@ -294,10 +310,20 @@ class MatcherDirecto:
                 a0, a1 = anios[0], anios[-1]
             else:
                 a0, a1 = min(d), max(d)   # toda la serie disponible
+=======
+                    f"entre 2014 y 2024.\n\nAños disponibles: {disp}.")
+            return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
+                    "via": "directo_fuera_rango", "score": round(mejor_score, 3)}
+
+        # ── Evolución (dos o más años)
+        if len(anios) >= 2:
+            a0, a1 = anios[0], anios[-1]
+>>>>>>> 11ea89544e428856f0ad354c553fa14d303ae4e4
             tramo  = [(a, d[a]) for a in sorted(d) if a0 <= a <= a1]
             if not tramo:
                 return None
             lineas = [f"- {a}: {self._fmt_valor(v[0], v[1], mejor)}" for a, v in tramo]
+<<<<<<< HEAD
             serie_txt = "\n".join(lineas)
             prim, ult = tramo[0][1][0], tramo[-1][1][0]
             resumen = ""
@@ -313,6 +339,18 @@ class MatcherDirecto:
                     "via": "directo_evolucion", "score": round(mejor_score, 3),
                     "interpretar": True, "serie": serie_txt, "resumen": resumen,
                     "nombre_ind": mejor["nombre"]}
+=======
+            txt = (f"**{mejor['nombre']}** ({mejor['tema']}), evolución {a0}–{a1}:\n\n"
+                   + "\n".join(lineas))
+            prim, ult = tramo[0][1][0], tramo[-1][1][0]
+            if prim not in (None, 0) and ult is not None:
+                var   = (ult - prim) / abs(prim) * 100
+                signo = "aumentó" if var > 0 else "disminuyó"
+                txt += (f"\n\nEntre {tramo[0][0]} y {tramo[-1][0]} {signo} "
+                        f"{abs(var):.1f}% en términos relativos.")
+            return {"respuesta": txt + pie, "indicador": mejor["nombre"], "tema": mejor["tema"],
+                    "via": "directo_evolucion", "score": round(mejor_score, 3)}
+>>>>>>> 11ea89544e428856f0ad354c553fa14d303ae4e4
 
         # ── Año puntual
         if len(anios) == 1:
@@ -576,6 +614,7 @@ def responder(pregunta: str) -> dict:
     # 0. Capa directa sin LLM: gratis, instantánea y sin alucinación.
     directo = matcher.resolver(pregunta)
     if directo is not None:
+<<<<<<< HEAD
         enlace = enlace_excel(directo.get("tema", ""))
         # Preguntas de evolución/tendencia: el LLM interpreta la serie en lenguaje natural.
         if directo.get("interpretar"):
@@ -599,6 +638,9 @@ def responder(pregunta: str) -> dict:
                 return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
                         "sql": None, "chunks": [], "error": None}
         respuesta = directo["respuesta"] + enlace
+=======
+        respuesta = directo["respuesta"] + enlace_excel(directo.get("tema", ""))
+>>>>>>> 11ea89544e428856f0ad354c553fa14d303ae4e4
         return {"respuesta": respuesta, "tipo": "directo",
                 "sql": None, "chunks": [], "error": None}
 
