@@ -168,7 +168,10 @@ def normalizar(texto: str) -> str:
 
 
 def tokens_utiles(texto: str) -> set:
-    return {w for w in normalizar(texto).split() if w not in STOPWORDS and len(w) > 2}
+    # Los años (2014, 2023...) no son parte del nombre del indicador: si contaran,
+    # bajarían el puntaje de preguntas como "¿déficit cualitativo en 2022?".
+    return {w for w in normalizar(texto).split()
+            if w not in STOPWORDS and len(w) > 2 and not re.fullmatch(r"(19|20)\d{2}", w)}
 
 
 def extraer_anios(pregunta: str) -> list:
@@ -217,6 +220,7 @@ class MatcherDirecto:
                 f"SELECT id_indicador, nombre, tema, {campo_formato} FROM indicadores"
             ).fetchall()
         ]
+        self.por_id = {i["id"]: i for i in self.indicadores}
 
     # ── scoring ──────────────────────────────────────────────
     def _score(self, tks_preg, norm_preg, ind):
@@ -253,7 +257,6 @@ class MatcherDirecto:
     # ── resolución ───────────────────────────────────────────
     def resolver(self, pregunta: str):
         """Retorna dict con la respuesta lista, o None si no está seguro."""
-        anios     = extraer_anios(pregunta)
         puntuados = self.buscar(pregunta)
         if not puntuados:
             return None
@@ -266,6 +269,12 @@ class MatcherDirecto:
         if (mejor_score - segundo_score) < self.MARGEN_CLARO:
             return None                      # ambiguo entre varios indicadores
 
+        return self.resolver_indicador(pregunta, mejor, mejor_score)
+
+    def resolver_indicador(self, pregunta: str, mejor: dict, mejor_score: float = 1.0):
+        """Arma la respuesta directa para un indicador YA identificado, sea por
+        este matcher o por el identificador con catálogo (identificador.py)."""
+        anios = extraer_anios(pregunta)
         serie = self.conn.execute(
             """SELECT anio, valor_numerico, valor_texto FROM mediciones
                WHERE id_indicador=?
@@ -388,42 +397,35 @@ def construir_historial(mensajes: list) -> list:
     return hist[-(MAX_TURNOS_MEMORIA * 2):]
 
 
-PALABRAS_SQL = ["cuánto", "cuanto", "cuál fue", "cual fue", "valor", "porcentaje",
-                "tasa", "cantidad", "evolución", "evolucion", "comparar", "entre 20",
-                "en 20", "promedio", "más reciente", "mas reciente", "último", "ultimo"]
-PALABRAS_CHROMA = ["metodología", "metodologia", "cómo se mide", "como se mide",
-                   "qué significa", "que significa", "explicá", "explica", "por qué",
-                   "por que", "definición", "definicion", "informe", "documento"]
-PALABRAS_FUERA = ["pizzería", "pizzeria", "playa", "restaurante", "hotel", "clima",
-                  "receta", "chiste", "fútbol", "futbol"]
+# ─────────────────────────────────────────────
+# Identificación de indicadores con el CATÁLOGO COMPLETO (identificador.py)
+# ─────────────────────────────────────────────
+# Una sola llamada al modelo clasificador (Haiku) recibe la lista de los ~270
+# indicadores de la base y devuelve: tipo de pregunta + id(s) del indicador +
+# la pregunta reescrita con el nombre oficial. Así se reconocen nombres
+# incompletos, sinónimos, errores de tipeo y preguntas de seguimiento sin que
+# haya que escribir el nombre literal. El catálogo va con caché de prompt.
+# Reemplaza a las reglas por palabras clave, que además rechazaban como
+# "fuera de alcance" preguntas válidas (ej. playas u ocupación hotelera).
+from identificador import Identificador
 
 
-def clasificar_por_reglas(pregunta: str):
-    p = pregunta.lower()
-    if any(w in p for w in PALABRAS_FUERA):
-        return {"tipo": "fuera_alcance", "razon": "regla"}
-    sql = any(w in p for w in PALABRAS_SQL)
-    chr = any(w in p for w in PALABRAS_CHROMA)
-    if sql and chr: return {"tipo": "ambos", "razon": "regla"}
-    if sql:  return {"tipo": "sql", "razon": "regla"}
-    if chr:  return {"tipo": "chroma", "razon": "regla"}
-    return None
+@st.cache_resource
+def cargar_identificador():
+    return Identificador(
+        conn_db, claude, MODELO_CLASIFICADOR,
+        # mismos formatos que la capa directa (porcentajes, coma decimal)
+        formatear=lambda id_ind, vn, vt: matcher._fmt_valor(
+            vn, vt, matcher.por_id.get(id_ind, {"formato": "numero"})),
+    )
+
+identificador = cargar_identificador()
 
 
-def clasificar_pregunta(pregunta: str) -> dict:
-    regla = clasificar_por_reglas(pregunta)
-    if regla is not None:
-        return regla
-    system = ('Clasificá la pregunta y respondé SOLO con JSON: '
-              '{"tipo": "sql"|"chroma"|"ambos"|"fuera_alcance", "razon": "breve"}. '
-              'sql=dato numérico; chroma=contexto PDF; ambos=dato+contexto; '
-              'fuera_alcance=no es sobre indicadores urbanos de Mar del Plata.')
-    texto = llamar_claude(system, pregunta, MODELO_CLASIFICADOR, 150)
-    try:
-        match = re.search(r"\{.*?\}", texto, re.DOTALL)
-        return json.loads(match.group()) if match else {"tipo": "ambos", "razon": "fallback"}
-    except Exception:
-        return {"tipo": "ambos", "razon": "error"}
+def clasificar_pregunta(pregunta: str, historial: list | None = None) -> dict:
+    """Devuelve {"tipo", "ids", "ambigua", "pregunta_completa", "razon",
+    "indicadores", "error"}. Ver identificador.py."""
+    return identificador.identificar(pregunta, historial)
 
 
 PALABRAS_PELIGROSAS = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE", "ATTACH", "PRAGMA"]
@@ -628,55 +630,66 @@ def listado_coleccion9_markdown() -> str:
     return "\n".join(lineas)
 
 
+def responder_directo(directo: dict, pregunta: str, historial: list | None = None,
+                      tipo: str | None = None, sql: dict | None = None) -> dict:
+    """El DATO sale de la base (exacto, sin alucinación); Claude solo lo redacta
+    en tono conversacional y sigue el hilo. 'tipo' y 'sql' sirven para mostrar en
+    los detalles técnicos que el indicador lo identificó la IA con el catálogo."""
+    enlace = enlace_excel(directo.get("tema", ""))
+
+    # a. Evolución / tendencia: Claude interpreta la serie completa.
+    if directo.get("interpretar"):
+        try:
+            system = (
+                "Sos el asistente conversacional de Mar del Plata Entre Todos. "
+                "Te paso la serie histórica REAL de un indicador. Redactá una "
+                "lectura clara y natural de su evolución, en español rioplatense: "
+                "tendencia general, cuánto cambió, y los años de subas o bajas "
+                "marcadas si las hay. USÁ SOLO los valores provistos; no inventes "
+                "ni estimes años faltantes. Tené en cuenta el hilo de la charla "
+                "si la persona viene preguntando algo relacionado. "
+                "Sé conciso (4-6 líneas). No repitas toda la lista año por año.")
+            user = (f"Indicador: {directo['nombre_ind']}\n\n"
+                    f"Serie:\n{directo['serie']}\n\n"
+                    f"{directo.get('resumen','')}\n\nPregunta: {pregunta}")
+            narracion = llamar_claude(system, user, MODELO_RESPUESTA, 500,
+                                      historial=historial)
+            respuesta = (f"{directo['respuesta']}\n\n---\n\n{narracion}{enlace}")
+            return {"respuesta": respuesta, "tipo": tipo or "evolucion",
+                    "sql": sql, "chunks": [], "error": None}
+        except Exception:
+            # Si falla el LLM, al menos devolvemos la serie (gratis, sin romper).
+            return {"respuesta": directo["respuesta"] + enlace, "tipo": tipo or "directo",
+                    "sql": sql, "chunks": [], "error": None}
+
+    # b. Dato puntual / último valor: Claude lo envuelve en una frase natural.
+    #    El número ya está calculado en directo["respuesta"]; Claude NO lo cambia.
+    try:
+        user = (f"DATO VERIFICADO (de la base oficial):\n{directo['respuesta']}"
+                f"{enlace}\n\nPregunta de la persona: {pregunta}\n\n"
+                "Redactá la respuesta conversacional usando ese dato exacto.")
+        texto = llamar_claude(SYSTEM_CONVERSA, user, MODELO_RESPUESTA, 400,
+                              historial=historial)
+        return {"respuesta": texto, "tipo": tipo or "directo",
+                "sql": sql, "chunks": [], "error": None}
+    except Exception:
+        # Fallback: si Claude falla, devolvemos el texto directo (gratis, sin romper).
+        return {"respuesta": directo["respuesta"] + enlace, "tipo": tipo or "directo",
+                "sql": sql, "chunks": [], "error": None}
+
+
 def responder(pregunta: str, historial: list | None = None) -> dict:
-    # 0. Capa directa: el DATO sale de la base (exacto, sin alucinación);
-    #    Claude solo lo redacta en tono conversacional y sigue el hilo.
+    # 0. Capa directa (gratis): el matcher reconoce el indicador con alta confianza.
     directo = matcher.resolver(pregunta)
     if directo is not None:
-        enlace = enlace_excel(directo.get("tema", ""))
+        return responder_directo(directo, pregunta, historial)
 
-        # 0.a Evolución / tendencia: Claude interpreta la serie completa.
-        if directo.get("interpretar"):
-            try:
-                system = (
-                    "Sos el asistente conversacional de Mar del Plata Entre Todos. "
-                    "Te paso la serie histórica REAL de un indicador. Redactá una "
-                    "lectura clara y natural de su evolución, en español rioplatense: "
-                    "tendencia general, cuánto cambió, y los años de subas o bajas "
-                    "marcadas si las hay. USÁ SOLO los valores provistos; no inventes "
-                    "ni estimes años faltantes. Tené en cuenta el hilo de la charla "
-                    "si la persona viene preguntando algo relacionado. "
-                    "Sé conciso (4-6 líneas). No repitas toda la lista año por año.")
-                user = (f"Indicador: {directo['nombre_ind']}\n\n"
-                        f"Serie:\n{directo['serie']}\n\n"
-                        f"{directo.get('resumen','')}\n\nPregunta: {pregunta}")
-                narracion = llamar_claude(system, user, MODELO_RESPUESTA, 500,
-                                          historial=historial)
-                respuesta = (f"{directo['respuesta']}\n\n---\n\n{narracion}{enlace}")
-                return {"respuesta": respuesta, "tipo": "evolucion",
-                        "sql": None, "chunks": [], "error": None}
-            except Exception:
-                # Si falla el LLM, al menos devolvemos la serie (gratis, sin romper).
-                return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
-                        "sql": None, "chunks": [], "error": None}
-
-        # 0.b Dato puntual / último valor: Claude lo envuelve en una frase natural.
-        #     El número ya está calculado en directo["respuesta"]; Claude NO lo cambia.
-        try:
-            user = (f"DATO VERIFICADO (de la base oficial):\n{directo['respuesta']}"
-                    f"{enlace}\n\nPregunta de la persona: {pregunta}\n\n"
-                    "Redactá la respuesta conversacional usando ese dato exacto.")
-            texto = llamar_claude(SYSTEM_CONVERSA, user, MODELO_RESPUESTA, 400,
-                                  historial=historial)
-            return {"respuesta": texto, "tipo": "directo",
-                    "sql": None, "chunks": [], "error": None}
-        except Exception:
-            # Fallback: si Claude falla, devolvemos el texto directo (gratis, sin romper).
-            return {"respuesta": directo["respuesta"] + enlace, "tipo": "directo",
-                    "sql": None, "chunks": [], "error": None}
-
-    clasificacion = clasificar_pregunta(pregunta)
-    tipo = clasificacion["tipo"]
+    # 1. Identificación con el catálogo completo: tipo + indicador(es) + pregunta
+    #    reescrita con el nombre oficial (resuelve también "¿y en 2019?").
+    clasificacion     = clasificar_pregunta(pregunta, historial)
+    tipo              = clasificacion["tipo"]
+    ids               = clasificacion.get("ids") or []
+    pregunta_busqueda = clasificacion.get("pregunta_completa") or pregunta
 
     if tipo == "fuera_alcance":
         return {"respuesta": ("Esta pregunta está fuera del alcance del chatbot. "
@@ -684,15 +697,33 @@ def responder(pregunta: str, historial: list | None = None) -> dict:
                               "fiscales de Mar del Plata."),
                 "tipo": tipo, "sql": None, "chunks": [], "error": None}
 
+    # 1.a Un solo indicador, sin ambigüedad, y piden el dato → misma respuesta
+    #     que la capa directa (año puntual, evolución o último dato).
+    if tipo == "sql" and len(ids) == 1 and not clasificacion.get("ambigua"):
+        ind = matcher.por_id.get(ids[0])
+        if ind:
+            directo = matcher.resolver_indicador(pregunta_busqueda, ind)
+            if directo is not None:
+                detalle_sql = {"sql": (f"-- Indicador identificado por IA: {ind['nombre']} "
+                                       f"({ind['tema']})\n-- Pregunta interpretada: "
+                                       f"{pregunta_busqueda}"),
+                               "filas": [], "error": None}
+                return responder_directo(directo, pregunta, historial,
+                                         tipo="identificado", sql=detalle_sql)
+
+    # 1.b Varios indicadores, ambigüedad, o dato + explicación.
     res_sql = res_chroma = None
     if tipo in ("sql", "ambos"):
-        res_sql = generar_y_ejecutar_sql(pregunta)
+        if ids:
+            res_sql = identificador.datos_por_ids(ids)      # directo por id, sin SQL generado
+        else:
+            res_sql = generar_y_ejecutar_sql(pregunta_busqueda)   # preguntas generales
     if tipo in ("chroma", "ambos"):
-        res_chroma = buscar_chroma(pregunta)
+        res_chroma = buscar_chroma(pregunta_busqueda)
 
-    # Respaldo: si el SQL no trajo filas pero la pregunta menciona un indicador
-    # reconocible, recuperamos la serie directo de la base (sin LLM).
-    if res_sql is None or not res_sql["filas"]:
+    # Respaldo: solo si la identificación falló (ej. error de la API). Antes se
+    # usaba siempre con puntaje bajo (0.20) y podía elegir el indicador equivocado.
+    if clasificacion.get("error") and (res_sql is None or not res_sql["filas"]):
         candidatos = matcher.buscar(pregunta)
         if candidatos and candidatos[0][0] >= 0.20:
             ind = candidatos[0][1]
@@ -720,6 +751,10 @@ def responder(pregunta: str, historial: list | None = None) -> dict:
                 "tipo": "sin_datos", "sql": res_sql, "chunks": [], "error": None}
 
     partes = []
+    if clasificacion.get("ambigua"):
+        partes.append("NOTA: la pregunta puede referirse a cualquiera de los indicadores "
+                      "de abajo. Mostrá brevemente el dato de cada uno y preguntale a la "
+                      "persona a cuál se refiere.")
     if res_sql and not res_sql["error"] and res_sql["filas"]:
         partes.append("=== BASE DE INDICADORES (Excel/SQLite) ===")
         for fila in res_sql["filas"][:15]:
@@ -732,9 +767,11 @@ def responder(pregunta: str, historial: list | None = None) -> dict:
             partes.append(c["texto"])
     contexto = "\n".join(partes) if partes else "No se encontró información relevante."
 
+    interpretada = (f"\n(Interpretada como: {pregunta_busqueda})"
+                    if pregunta_busqueda != pregunta else "")
     respuesta_texto = llamar_claude(
         SYSTEM_RESPUESTA,
-        f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta}",
+        f"CONTEXTO:\n{contexto}\n\nPREGUNTA:\n{pregunta}{interpretada}",
         MODELO_RESPUESTA, 800,
         historial=historial,
     )
@@ -813,7 +850,9 @@ def render_detalle(det):
         "sql":    "📊 Datos de la base de indicadores (Excel/SQLite)",
         "chroma": "📄 Búsqueda en informes PDF",
         "ambos":  "📊📄 Base de indicadores + Informes PDF",
-        "directo": "⚡ Respuesta directa desde la base (sin IA)",
+        "directo": "⚡ Dato directo desde la base",
+        "evolucion": "📈 Serie histórica desde la base",
+        "identificado": "🎯 Indicador reconocido por IA · dato desde la base",
         "sin_datos": "🔗 Sin datos suficientes — derivado al repositorio",
     }.get(det.get("tipo", ""), "")
     if tipo_label:
