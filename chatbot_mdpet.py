@@ -412,12 +412,18 @@ from identificador import Identificador
 
 @st.cache_resource
 def cargar_identificador():
-    return Identificador(
-        conn_db, claude, MODELO_CLASIFICADOR,
-        # mismos formatos que la capa directa (porcentajes, coma decimal)
-        formatear=lambda id_ind, vn, vt: matcher._fmt_valor(
-            vn, vt, matcher.por_id.get(id_ind, {"formato": "numero"})),
-    )
+    # Si algo falla al armar el catálogo, la app sigue andando sin identificador
+    # (como antes) en vez de caerse; el motivo queda en los logs.
+    try:
+        return Identificador(
+            conn_db, claude, MODELO_CLASIFICADOR,
+            # mismos formatos que la capa directa (porcentajes, coma decimal)
+            formatear=lambda id_ind, vn, vt: matcher._fmt_valor(
+                vn, vt, matcher.por_id.get(id_ind, {"formato": "numero"})),
+        )
+    except Exception as e:
+        print(f"[identificador] desactivado: {e!r}")
+        return None
 
 identificador = cargar_identificador()
 
@@ -425,6 +431,10 @@ identificador = cargar_identificador()
 def clasificar_pregunta(pregunta: str, historial: list | None = None) -> dict:
     """Devuelve {"tipo", "ids", "ambigua", "pregunta_completa", "razon",
     "indicadores", "error"}. Ver identificador.py."""
+    if identificador is None:
+        return {"tipo": "ambos", "ids": [], "ambigua": False, "pregunta_completa": pregunta,
+                "razon": "identificador no disponible", "indicadores": [],
+                "error": "identificador no disponible"}
     return identificador.identificar(pregunta, historial)
 
 

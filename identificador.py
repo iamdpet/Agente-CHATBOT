@@ -93,19 +93,22 @@ class Identificador:
 
     # ── Catálogo ───────────────────────────────────────────────────────────
     def _leer_indicadores(self) -> dict:
+        # Solo id_indicador, nombre y tema son obligatorias; 'unidad' y 'sinonimos'
+        # se usan si existen (según la versión del notebook 01 que armó la base).
         columnas = {r[1] for r in self.conn.execute("PRAGMA table_info(indicadores)")}
+        col_unidad = "unidad" if "unidad" in columnas else "NULL"
         col_sin = "sinonimos" if "sinonimos" in columnas else "NULL"
         filas = self.conn.execute(
-            f"SELECT id_indicador, nombre, tema, unidad, {col_sin} "
+            f"SELECT id_indicador, nombre, tema, {col_unidad}, {col_sin} "
             "FROM indicadores ORDER BY tema, nombre"
         ).fetchall()
         return {
             int(f[0]): {
                 "id": int(f[0]),
                 "nombre": str(f[1]).strip(),
-                "tema": str(f[2]).strip(),
-                "unidad": (f[3] or "").strip(),
-                "sinonimos": (f[4] or "").strip(),
+                "tema": str(f[2] or "").strip(),
+                "unidad": str(f[3] or "").strip(),
+                "sinonimos": str(f[4] or "").strip(),
             }
             for f in filas
         }
